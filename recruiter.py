@@ -1,0 +1,1116 @@
+# ===================================================================================
+#      AI 招聘助理 v20.0 - Fedora 高并发版 (Graduation Project)
+# ===================================================================================
+# 版本亮点 (基于 v15.2):
+# - [引擎更换] 数据库从 ChromaDB 彻底更换为 Qdrant，接入中央数据库枢纽 ai_database_hub。
+# - [模型统一] 引入 sentence-transformers 本地模型，实现与生态系统一致的 Embedding 方案。
+# - [性能飞跃] 引入 asyncio 和 asyncio.Queue，将核心处理流程重构为高并发“生产者-消费者”流水线。
+# - [全链路异步] 所有网络 I/O (Gemini, Notion API) 全部升级为异步调用，最大化并发效率。
+# - [CPU解耦] 文件读取等阻塞操作被放入 Executor 中执行，避免阻塞事件循环。
+# - [架构统一] 完美集成了另外两个程序（生态核心、知识库助理）的先进架构理念。
+# ===================================================================================
+
+import time
+import shutil
+from datetime import datetime, timezone, timedelta
+# import google.generativeai as genai # <--- 已移除
+import sys
+import os
+import re
+import json
+import notion_client
+# ... (其他 imports)
+from notion_client.errors import APIResponseError
+import hashlib
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import traceback
+import asyncio # <--- 确保 asyncio 已导入
+
+# 添加 LangChain 对接本地模型的库
+from langchain_ollama import ChatOllama
+from langchain_ollama import OllamaEmbeddings
+
+# 【【【 v20.0 改造：引入 Qdrant, 本地模型, 和 asyncio 】】】
+from qdrant_client import QdrantClient, models
+# from sentence_transformers import SentenceTransformer # <--- 已移除
+
+# 【【【 核心修正：引入 dotenv 来加载 .env 文件中的环境变量 】】】
+from dotenv import load_dotenv
+load_dotenv() # 程序启动时，首先执行这一行来加载 .env 文件
+
+# ==============================================================================
+# ⬇⬇⬇ 0. 用户配置区 (现在从 .env 文件安全加载) ⬇⬇⬇
+# ==============================================================================
+# --- 核心API密钥 ---
+# API_KEY = os.getenv("API_KEY") # <--- 已注释掉或删除
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+
+# --- Google Search Configuration ---
+ENABLE_GOOGLE_SEARCH = os.getenv("ENABLE_GOOGLE_SEARCH", "True").lower() == "true"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+# --- Notion Database IDs ---
+JD_HUB_DATABASE_ID = os.getenv("JD_HUB_DATABASE_ID")
+CANDIDATE_DB_ID = os.getenv("CANDIDATE_DB_ID")
+CANDIDATE_PROFILE_HUB_DB_ID = os.getenv("CANDIDATE_PROFILE_HUB_DB_ID")
+TRAINING_HUB_DATABASE_ID = os.getenv("TRAINING_HUB_DATABASE_ID")
+COMPANY_DB_ID = os.getenv("COMPANY_DB_ID")
+
+# --- Notion属性名配置 (v15.1 最终版) ---
+NOTION_PROPS = {
+    # 候选人分析库
+    "analysis_name": "候选人姓名", "analysis_score": "匹配度评分", "analysis_reason": "评分理由",
+    "analysis_date": "分析日期", "analysis_source": "源文件名", "analysis_phone": "联系电话",
+    "analysis_email": "候选人邮箱", "analysis_priority": "优先级", "analysis_best_fit_position": "最匹配职位",
+    "analysis_top_score": "最高匹配分", "analysis_update_flag": "简历已更新",
+    "analysis_relation_to_company": "关联公司情报",
+
+    # JD库
+    "jd_hard_requirements": "硬性门槛", "jd_status": "状态", "jd_title": "职位名称",
+
+    # 候选人信息库 (Profile Hub)
+    "profile_name": "姓名", "profile_age": "年龄", "profile_gender": "性别", "profile_education": "学历",
+    "profile_experience": "岗位经验", "profile_relation_to_analysis": "关联分析报告",
+    "profile_employment_status": "离职状态", "profile_core_skills": "核心能力或技能",
+    "profile_current_location": "目前所在地", "profile_expected_city": "期望城市",
+    "profile_current_salary": "目前薪资", "profile_expected_salary": "期望薪资",
+    "profile_availability": "到岗时间", "profile_copy_paste_area": "一键复制区",
+    "profile_resume_hash": "简历内容哈希",
+    "profile_web_summary": "背景调查摘要",
+    "profile_similar_candidates": "历史相似人才",
+    "profile_relation_to_company": "关联任职公司情报",
+
+    # 训练中心库
+    "training_task_title": "训练任务", "training_task_type": "任务类型", "training_input": "源数据 (Input)",
+    "training_output": "理想输出 (Output)", "training_status": "标注状态", "training_relation_to_candidate": "源链接-候选人中心",
+
+    # 公司情报库
+    "comp_name": "公司名称", "comp_one_liner": "一句话简介", "comp_industry": "行业赛道",
+    "comp_tech_stack": "技术栈", "comp_core_business": "核心业务与产品", "comp_competitors": "主要竞争对手",
+    "comp_latest_news": "最新动态融资", "comp_swot": "SWOT 分析", "comp_info_source": "信息来源",
+    "comp_relation_to_analysis": "候选人档案",
+    "comp_relation_to_profile": "候选人信息库",
+}
+
+# --- 系统与模型配置 ---
+JOB_SEPARATOR = "---JOB_SEPARATOR---"
+# SAFETY_SETTINGS = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+ACTIVE_JD_DATA = {}
+
+# 【【【 v20.0 改造：引入 Qdrant 和本地模型 】】】
+QDRANT_CLIENT = None
+# EMBEDDING_MODEL 的类型变了，但变量名不变
+EMBEDDING_MODEL = None
+# LLM 变量，用来存放我们的大脑模型
+LLM = None # <--- 新增
+IS_RAG_ENABLED = False
+# 为招聘助理定义一个专属的、独立的 Collection 名称
+# 【【【 修改后的新配置 】】】
+RECRUITMENT_COLLECTION_NAME = "ai_recruitment_assistant_embeddinggemma"
+# 高并发 Worker 数量，可根据 CPU 核心数调整
+WORKER_COUNT = 8
+
+# ==============================================================================
+# ⬇⬇⬇ 系统设置 & 核心辅助函数 (v20.0 异步适配版) ⬇⬇⬇
+# ==============================================================================
+
+# 【【【 v20.0 改造：全新的 Qdrant 设置函数 】】】
+# 【【【 v20.0 本地化升级版 】】】
+def setup_qdrant_and_embedding():
+    global QDRANT_CLIENT, EMBEDDING_MODEL, IS_RAG_ENABLED
+    try:
+        print(">> [知识库] 正在初始化本地 embedding 模型 (Ollama/embeddinggemma)...")
+        # 使用 OllamaEmbeddings
+        EMBEDDING_MODEL = OllamaEmbeddings(model="embeddinggemma")
+        
+        print(">> [知识库] 正在动态检测 embeddinggemma 的向量维度...")
+        test_vector = EMBEDDING_MODEL.embed_query("test")
+        vector_size = len(test_vector)
+        print(f">> [知识库] 自动检测到向量维度为: {vector_size}。")
+        
+        print(">> [知识库] 正在连接到中央数据库枢纽 (localhost:6333)...")
+        QDRANT_CLIENT = QdrantClient(host="localhost", port=6333)
+
+        collections_response = QDRANT_CLIENT.get_collections()
+        collection_names = [col.name for col in collections_response.collections]
+        if RECRUITMENT_COLLECTION_NAME not in collection_names:
+            print(f">> [知识库] 集合 '{RECRUITMENT_COLLECTION_NAME}' 不存在，正在创建...")
+            QDRANT_CLIENT.recreate_collection(
+                collection_name=RECRUITMENT_COLLECTION_NAME,
+                vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
+            )
+        
+        count_result = QDRANT_CLIENT.count(collection_name=RECRUITMENT_COLLECTION_NAME, exact=True)
+        print(f"✅ [知识库] 成功连接！当前招聘库中有 {count_result.count} 条记录。")
+        IS_RAG_ENABLED = True
+    except Exception as e:
+        print(f"❌ [知识库] 严重错误: 无法连接或设置 Qdrant/Ollama Embedding: {e}")
+        print("   -> 请确保 Qdrant 容器正在运行，并且 Ollama 服务已启动并下载了 'embeddinggemma' 模型！")
+        IS_RAG_ENABLED = False
+
+
+# 【【【 v20.0 本地化升级版 】】】
+def configure_llm():
+    global LLM
+    try:
+        print(">> [AI大脑] 正在初始化本地大语言模型 (Ollama/llama3:8b)...")
+        LLM = ChatOllama(model="llama3:8b", temperature=0.1)
+        # 我们可以简单地调用一下来确认模型是否正常工作
+        LLM.invoke("你好") 
+        print("✅ [AI大脑] 本地大语言模型 (llama3:8b) 已准备就绪。")
+        return True
+    except Exception as e:
+        print(f"❌ [AI大脑] 严重错误: 无法初始化本地LLM: {e}")
+        print("   -> 请确保 Ollama 服务已启动并下载了 'llama3:8b' 模型！")
+        return False
+
+# ==============================================================================
+# ⬇⬇⬇ get_page_content_async 函数的【最终正确版 v3.0】 ⬇⬇⬇
+# ==============================================================================
+async def get_page_content_async(async_notion_client, page_id):
+    content = []
+    try:
+        # 【【【 核心修正：这才是正确的异步分页方式 】】】
+        # 1. 首先，我们 `await` 这个函数，它会处理所有分页，并返回一个包含所有 block 的【普通列表】
+        all_blocks = await notion_client.helpers.async_collect_paginated_api(
+            async_notion_client.blocks.children.list,
+            block_id=page_id
+        )
+
+        # 2. 因为 all_blocks 现在是一个普通的列表，我们用一个【普通的 for 循环】来处理它
+        for block in all_blocks:
+            block_type = block.get('type')
+            if block_type and block_type in block and 'rich_text' in block[block_type]:
+                for text_part in block[block_type].get('rich_text', []):
+                    content.append(text_part.get('plain_text', ''))
+        return "\n".join(content)
+    except Exception as e:
+        print(f"   !! [深度抓取] 读取页面 {page_id} 内容失败: {e}")
+        return ""
+# ==============================================================================
+# ⬇⬇⬇ 下面是 load_active_jd_from_notion_async 函数的【最终修正版】 ⬇⬇⬇
+# ==============================================================================
+async def load_active_jd_from_notion_async():
+    global ACTIVE_JD_DATA
+    try:
+        print(">> [JD加载器] 正在从Notion同步 'Active' 状态的职位描述 (JD)...")
+        async_notion = notion_client.AsyncClient(auth=NOTION_TOKEN)
+        jds = {}
+        
+        # 【【【 核心修正：直接获取分页结果列表 】】】
+        # async_collect_paginated_api 实际上可以直接返回一个列表，我们不需要自己去循环
+        # 这个函数会处理所有的分页逻辑
+        active_pages = await notion_client.helpers.async_collect_paginated_api(
+            async_notion.databases.query,
+            database_id=JD_HUB_DATABASE_ID,
+            filter={"property": NOTION_PROPS["jd_status"], "select": {"equals": "Active"}}
+        )
+
+        if not active_pages:
+            print(f"⚠️ [JD加载器] 未在Notion中找到任何状态为 'Active' 的JD。请检查您的JD Hub。")
+            return False
+            
+        print(f">> [深度抓取] 发现 {len(active_pages)} 个有效职位，开始并发抓取正文内容...")
+
+        async def fetch_jd_content(page):
+            page_id = page.get('id')
+            props = page.get('properties', {})
+            title_list = props.get(NOTION_PROPS["jd_title"], {}).get('title', [])
+            title = title_list[0].get('plain_text', f"Unknown_{page_id}") if title_list else f"Unknown_{page_id}"
+            hard_reqs_prop_text = "".join(t.get('plain_text', '') for t in props.get(NOTION_PROPS["jd_hard_requirements"], {}).get('rich_text', []))
+            
+            page_body_text = await get_page_content_async(async_notion, page_id)
+            full_jd_text = f"职位核心职责与要求:\n{page_body_text}\n\n硬性门槛与关键资格:\n{hard_reqs_prop_text}".strip()
+            
+            if full_jd_text:
+                print(f"  ✅ 成功抓取: {title}")
+                return title, {"content": full_jd_text, "id": page_id}
+            else:
+                print(f"  ❌ 抓取失败或内容为空: {title}")
+                return None, None
+
+        # 因为 active_pages 现在是一个普通列表，我们可以直接创建并发任务
+        tasks = [fetch_jd_content(page) for page in active_pages]
+        results = await asyncio.gather(*tasks)
+        
+        jds = {title: data for title, data in results if title}
+        ACTIVE_JD_DATA = jds
+
+        if not jds:
+            print(f"⚠️ [JD加载器] 所有 'Active' 的JD页面内容均为空，无法进行匹配。")
+            return False
+            
+        print(f"✅ [JD加载器] 成功加载 {len(jds)} 个有效职位的完整JD。")
+        return True
+    except APIResponseError as e:
+        print(f"❌ [JD加载器] Notion API错误: {e.body}")
+        return False
+    except Exception as e:
+        import traceback
+        print(f"❌ [JD加载器] 从Notion同步JD时发生严重错误: {e}")
+        print(traceback.format_exc())
+        return False
+
+
+
+def clean_json_response(text):
+    """
+    终极 JSON 清洁函数 v2.2
+    - 能处理被 ```...``` 包裹或不被包裹的 JSON。
+    - 能处理 JSON 对象后面跟着额外文字的情况。
+    - 尝试修复由于模型幻觉导致的、结构错乱的 JSON。
+    """
+    # 尝试匹配 markdown 代码块
+    match = re.search(r"```(json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        content = match.group(2)
+    else:
+        # 如果没有代码块，就假设整个文本都是潜在的 JSON 或 JSON + 废话
+        content = text
+
+    # 从第一个 '{' 寻找到最后一个 '}'，这是最可靠的提取 JSON 对象的方式
+    start_index = content.find('{')
+    end_index = content.rfind('}')
+
+    if start_index == -1 or end_index == -1 or end_index < start_index:
+        print("   !! [JSON清洁工] 未在模型输出中找到有效的 JSON 大括号结构。")
+        return "{}"
+
+    json_str = content[start_index : end_index + 1]
+
+    # 最后的修复步骤：移除所有在 JSON 括号之外的、可能导致错误的逗号
+    # 这一步可以修复一些模型在生成 JSON 时犯的低级错误
+    json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+    # 移除对象开头或结尾处可能存在的多余逗号
+    json_str = re.sub(r'{\s*,', '{', json_str)
+    json_str = re.sub(r',\s*}', '}', json_str)
+    
+    return json_str
+def read_file_content(file_path):
+    # 此函数为CPU密集型，将在Executor中运行
+    try:
+        if not os.path.exists(file_path): return None, "文件不存在"
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.pdf':
+            import fitz
+            with fitz.open(file_path) as doc: return "".join(page.get_text() for page in doc), None
+        elif ext == '.docx':
+            import docx
+            return "\n".join([p.text for p in docx.Document(file_path).paragraphs]), None
+        elif ext == '.txt':
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: return f.read(), None
+        else: return None, f"不支持的文件类型: {ext}"
+    except Exception as e: return None, str(e)
+def get_content_hash(text): return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def split_text_for_notion(text, chunk_size=1999):
+    if not text or not isinstance(text, str): return [{"type": "text", "text": {"content": ""}}]
+    clean_text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
+    text_chunks = [clean_text[i:i + chunk_size] for i in range(0, len(clean_text), chunk_size)]
+    return [{"type": "text", "text": {"content": chunk}} for chunk in text_chunks]
+
+# ==============================================================================
+# ⬇⬇⬇ 超感知引擎 (网页搜索, 向量搜索, 公司情报) [v20.0 异步改造版] ⬇⬇⬇
+# ==============================================================================
+async def perform_google_search_async(query: str, **kwargs) -> str:
+    if not ENABLE_GOOGLE_SEARCH or not GOOGLE_API_KEY or "AIza" not in GOOGLE_API_KEY:
+        return "Google搜索功能未开启或未配置API密钥。"
+    try:
+        loop = asyncio.get_running_loop()
+        # Google API Client Library is not async, so we run it in an executor
+        def search():
+            service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
+            res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, **kwargs).execute()
+            if 'items' not in res: return ""
+            return "\n\n".join([f"- {item['title']}\n  {item.get('snippet', '无摘要')}" for item in res.get('items', [])])
+        
+        return await loop.run_in_executor(None, search)
+    except HttpError as e:
+        return f"Google搜索API错误: {e.reason}"
+    except Exception as e: return f"Google搜索时发生错误: {e}"
+
+COMPANY_ANALYSIS_PROMPT = """
+ROLE & GOAL: You are a professional business analyst. Your task is to synthesize the provided web search results about a company named "{company_name}" into a structured, insightful summary in Chinese.
+INPUT: Raw text containing Google search snippets about the company.
+{search_results}
+OUTPUT FORMAT: Strictly follow this JSON structure. Provide concise and neutral analysis in Chinese based ONLY on the provided text.
+{{
+"company_name": "{company_name}", "one_liner": "...", "industry_sector": ["..."], "tech_stack": ["..."],
+"core_business_products": "...", "competitors": ["..."], "latest_news_funding": "...",
+"swot_analysis": {{"strengths": "...", "weaknesses": "...", "opportunities": "...", "threats": "..."}},
+"info_source": "..."
+}}
+"""
+async def research_and_summarize_company_async(company_name):
+    if not ENABLE_GOOGLE_SEARCH or not company_name or company_name == 'N/A':
+        return None
+    # 【【【 修正：在此处临时导入和配置 genai 】】】
+    try:
+        import google.generativeai as genai
+        # 从环境变量中获取API_KEY，因为顶部的全局变量已被移除
+        g_api_key = os.getenv("API_KEY") 
+        if not g_api_key: raise ValueError("Google API Key not found in .env for optional search feature.")
+        genai.configure(api_key=g_api_key)
+    except (ImportError, ValueError) as e:
+        print(f"      !! [公司研究] 无法配置Google AI SDK: {e}. 请确保.env中有API_KEY以使用此可选功能。")
+        return None
+
+
+
+    print(f"      -> [公司研究] 正在启动对 '{company_name}' 的情报研究...")
+    search_queries = [f'"{company_name}" 新闻', f'"{company_name}" 融资', f'"{company_name}" 竞争对手', f'"{company_name}" 产品 技术栈']
+    
+    search_tasks = [perform_google_search_async(q, num=3) for q in search_queries]
+    search_results = await asyncio.gather(*search_tasks)
+    
+    all_snippets = ""
+    for q, res in zip(search_queries, search_results):
+        all_snippets += f"--- Query: {q} ---\n{res}\n\n"
+
+    if not all_snippets.strip():
+        print(f"      -> [公司研究] 未找到关于 '{company_name}' 的有效信息。")
+        return None
+    try:
+        model_flash = genai.GenerativeModel('models/gemini-2.5-flash-lite')
+        prompt = COMPANY_ANALYSIS_PROMPT.format(company_name=company_name, search_results=all_snippets[:30000])
+        response = await model_flash.generate_content_async(prompt, generation_config={"response_mime_type": "application/json"}, request_options={"timeout": 120})
+        
+        loop = asyncio.get_running_loop()
+        company_data = await loop.run_in_executor(None, json.loads, clean_json_response(response.text))
+
+        print(f"      ✅ [公司研究] 已完成对 '{company_name}' 的AI分析。")
+        return company_data
+    except Exception as e:
+        print(f"      !! [公司研究] AI分析 '{company_name}' 失败: {e}")
+        return None
+
+async def enrich_candidate_data_async(resume_text, candidate_name, company_names_list):
+    print(">> [超感知引擎] 正在并发执行数据增强...")
+    
+    async def web_search_task_async():
+        print("   -> [网络搜索] 正在执行候选人背景信息搜索...")
+        if not ENABLE_GOOGLE_SEARCH:
+            return "Google搜索功能已禁用。"
+        # 【【【 修正：在此处临时导入和配置 genai 】】】
+        try:
+            import google.generativeai as genai
+            g_api_key = os.getenv("API_KEY")
+            if not g_api_key: raise ValueError("Google API Key not found in .env for optional search feature.")
+            genai.configure(api_key=g_api_key)
+        except (ImportError, ValueError) as e:
+            print(f"   !! [网络搜索] 无法配置Google AI SDK: {e}.")
+            return "Google AI SDK配置失败。"
+        search_queries = []
+        if candidate_name and candidate_name != '未知候选人':
+            search_queries.extend([f'"{candidate_name}" "技术博客"', f'"{candidate_name}" GitHub', f'"{candidate_name}" 知乎 专栏'])
+            if company_names_list:
+                 search_queries.append(f'"{candidate_name}" "{company_names_list[0]}"')
+
+        if not search_queries:
+            return "因缺少候选人姓名，无法执行有效的网络搜索。"
+        
+        search_tasks = [perform_google_search_async(q, num=2) for q in search_queries]
+        search_results = await asyncio.gather(*search_tasks)
+        all_search_content = "".join([f"--- Query: {q} ---\n{res}\n\n" for q, res in zip(search_queries, search_results)])
+        
+        if all_search_content.strip() and "Google搜索功能未开启" not in all_search_content:
+            try:
+                model_flash = genai.GenerativeModel('models/gemini-2.5-flash-lite')
+                summary_prompt = f"请将以下关于一位名叫'{candidate_name}'的求职者的网络搜索结果，浓缩成一段2-3句话的中文摘要。重点关注其专业性、技术能力或任何潜在的亮点或风险点。\n\n{all_search_content[:15000]}"
+                response = await model_flash.generate_content_async(summary_prompt, request_options={"timeout": 120})
+                print("   ✅ [网络搜索] 成功生成候选人背景信息摘要。")
+                return response.text.strip()
+            except Exception as e:
+                print(f"   !! [网络搜索] 摘要生成失败: {e}")
+                return "搜索到网络信息，但AI摘要失败。"
+        else:
+            print("   -> [网络搜索] 未在网络上找到相关的公开专业信息。")
+            return "未在网络上找到相关的公开专业信息。"
+
+    async def vector_search_task_async():
+        print("   -> [向量搜索] 正在历史库中查找相似人才...")
+        if not IS_RAG_ENABLED: return "RAG功能未启用或无相似人才。"
+        try:
+            loop = asyncio.get_running_loop()
+            query_vector = await EMBEDDING_MODEL.aembed_query(resume_text) # <<< 修改后
+
+            results = await loop.run_in_executor(None, lambda: QDRANT_CLIENT.search(
+                collection_name=RECRUITMENT_COLLECTION_NAME,
+                query_vector=query_vector, # <<< 修改后 (去掉 .tolist())
+                # ...
+            ))
+            
+            documents = [hit.payload.get('summary_text', 'No summary found') for hit in results]
+            if documents:
+                print(f"   ✅ [向量搜索] 成功找到 {len(documents)} 位相似的历史候选人。")
+                return "\n\n---\n\n".join(documents)
+            return "未找到相似人才。"
+        except Exception as e:
+            print(f"   !! [向量搜索] 检索相似候选人时出错: {e}")
+            return "检索相似人才时出错。"
+
+    tasks = {
+        "web_summary": asyncio.create_task(web_search_task_async()),
+        "similar_candidates_context": asyncio.create_task(vector_search_task_async())
+    }
+    
+    company_tasks = {}
+    if company_names_list:
+        print("   -> [公司研究] 正在启动公司背景研究...")
+        unique_companies = list(set(c for c in company_names_list if c and c != "N/A"))[:3]
+        for company_name in unique_companies:
+            company_tasks[company_name] = asyncio.create_task(research_and_summarize_company_async(company_name))
+    else:
+        print("   -> [公司研究] 简历中未提取到公司名称，跳过研究。")
+
+    await asyncio.gather(*tasks.values(), *company_tasks.values())
+
+    results = {key: task.result() for key, task in tasks.items()}
+    results['company_research_results'] = [task.result() for task in company_tasks.values() if task.result()]
+    
+    print("✅ [超感知引擎] 所有数据增强任务已完成。")
+    return results
+
+# ==============================================================================
+# ⬇⬇⬇ AI分析 & Prompting (v20.0 异步改造版) ⬇⬇⬇
+# ==============================================================================
+HYPER_AWARE_PROMPT_V15 = """
+# 角色
+你是一位拥有上帝视角的AI技术招聘总监，以极度严谨和注重细节著称。你的任务是整合所有信息，给出一份无可挑剔的分析报告。
+
+# 任务
+1.  **【质检】**: 首先，判断【输入文本】是否为一份有效的候选人简历。
+2.  **【分析】**: 如果是有效简历，则严格对照【职位列表】中的每一项，并结合【背景调查】和【公司情报】进行逐项分析，最终填充【输出JSON】。
+
+# 核心规则
+1.  **质检优先**: 如果【输入文本】不是简历，`is_resume` 设为 `false`，并留空其他所有字段。绝不允许分析非简历内容。
+2.  **公司含金量评估**: 在分析每段工作经历时，必须参考【公司情报】来评估其“含金量”。在技术领先、业务复杂的公司工作，其经验价值更高。
+3.  **强制逐项分析**: 对于每个JD，必须将其要求分解，并对每一项进行独立的“是/否/不明确”评估。这个评估必须体现你对公司背景的考量。
+4.  **忠于事实，合理推断**: 所有判断必须基于原文，但可以在结合多方信息的基础上进行合理推断。
+5.  **完整提取档案**: 必须从简历中提取所有`profile_data`中要求的字段，找不到则填"N/A"。
+
+# 输入材料
+【输入1: 职位列表 (JDs from Notion)】
+{all_jds_text}
+---
+【输入2: 候选人简历】
+{resume_text}
+---
+【输入3: 背景调查与网络信息摘要 (from Google Search)】
+{web_summary}
+---
+【输入4: 公司背景情报 (from Company Research)】
+{company_context_summary}
+---
+【输入5: 历史相似人才参考 (from Vector DB)】
+{similar_candidates_context}
+
+# 输出格式 (严格遵循此JSON结构，不要输出任何额外文字)
+{{
+  "is_resume": true,
+  "profile_data": {{
+    "name": "...", "email": "...", "phone": "...", "age": 0, "gender": "N/A", "education": "...", "employment_status": "N/A",
+    "work_experience_summary": "...", "core_competencies": "...", "current_location": "...", "expected_city": "N/A",
+    "current_salary": "N/A", "expected_salary": "N/A", "availability": "N/A"
+  }},
+  "evaluation": {{
+    "position_analysis": [
+      {{
+        "position_title": "...",
+        "hard_req_breakdown": [
+          {{"requirement": "...", "met": "是", "reasoning": "(必须结合公司背景和简历证据)"}}
+        ],
+        "strengths_summary": "...",
+        "gaps_summary": "..."
+      }}
+    ]
+  }},
+  "overall_summary": {{
+    "key_rationale": "(综合所有信息，给出最终推荐或不推荐的核心理由，必须体现对公司背景、网络信息、历史人才的综合考量)",
+    "estimated_company_names": ["候选人主要任职过的公司名称列表"]
+  }}
+}}
+"""
+
+# 【【【 v20.0 本地化升级版 】】】
+async def analyze_with_hyper_awareness_v15_async(resume_text, all_jds_text, enhancement_data, worker_name=""):
+    if not resume_text or len(resume_text.strip()) < 50: return None
+    
+    # 注意：这里我们不再需要 gemini-flash-lite 模型，因此也移除了相关代码
+    # Google Search 相关的研究函数 research_and_summarize_company_async 仍会使用 Gemini
+    # 这是可选的，如果用户禁用了 Google Search，则完全不依赖 Google API
+    
+    company_context_summary = "\n\n".join([f"### {c.get('company_name')}\n{json.dumps(c, ensure_ascii=False, indent=2)}" for c in enhancement_data.get('company_research_results', []) if c]) or "无公司背景情报"
+    
+    prompt = HYPER_AWARE_PROMPT_V15.format(
+        all_jds_text=all_jds_text, 
+        resume_text=resume_text,
+        web_summary=enhancement_data.get('web_summary', '无背景调查信息'),
+        company_context_summary=company_context_summary,
+        similar_candidates_context=enhancement_data.get('similar_candidates_context', '无历史相似人才')
+    )
+
+    # LangChain 的 Ollama 对接库已经处理好了异步和重试
+    # 我们可以直接使用 ainvoke
+    for attempt in range(3):
+        try:
+            analysis_type = "深度" if enhancement_data else "初始"
+            print(f"\n[{worker_name}] [本地AI超感知{analysis_type}分析中...第 {attempt + 1}/3 次尝试...]")
+            
+                        # 【【【 修改为流式调用 (streaming) 以恢复实时输出 】】】
+            stream = LLM.astream(prompt)
+            full_response_text = ""
+            
+            # 实时打印流式输出，就像以前一样
+            async for chunk in stream:
+                # chunk.content 是每一小块返回的文本
+                print(chunk.content, end="", flush=True)
+                full_response_text += chunk.content
+            
+            print(f"\n[{worker_name}] [本地AI分析完成！]")
+            if not full_response_text.strip():
+                raise ValueError("本地LLM返回了空内容")
+            
+            return full_response_text
+            
+        except Exception as e:
+            print(f"\n[{worker_name}] 错误: {e}")
+            if attempt < 2: await asyncio.sleep(5)
+            
+    return None
+
+# ==============================================================================
+# ⬇⬇⬇ 报告格式化 & Notion交互 (v20.0 异步改造版) ⬇⬇⬇
+# ==============================================================================
+def sanitize_parsed_data(parsed_data):
+    if not isinstance(parsed_data, dict): return {}
+    profile = parsed_data.get('profile_data', {}); profile['name'] = profile.get('name') or "未知候选人"
+    profile['email'] = profile.get('email') or None; profile['phone'] = profile.get('phone') or None
+    parsed_data['profile_data'] = profile
+    evaluation = parsed_data.get('evaluation', {})
+    if 'position_analysis' not in evaluation: evaluation['position_analysis'] = []
+    parsed_data['evaluation'] = evaluation
+    if 'overall_summary' not in parsed_data: parsed_data['overall_summary'] = {"key_rationale": "AI未能生成综合评估。", "estimated_company_names": []}
+    return parsed_data
+
+def calculate_and_format_report_v15(parsed_data, filename="N/A", resume_text=""):
+    # 此函数为CPU密集型，将在Executor中运行
+    sanitized_data = sanitize_parsed_data(parsed_data)
+    profile_data = sanitized_data.get("profile_data", {})
+    analysis_list = sanitized_data.get("evaluation", {}).get("position_analysis", [])
+
+    for analysis in analysis_list:
+        breakdown = analysis.get("hard_req_breakdown", []); score_map = {"是": 1.0, "不明确": 0.5, "否": 0.0}
+        met_count = sum(1 for item in breakdown if item.get("met") == "是")
+        score_sum = sum(score_map.get(item.get("met", "否"), 0.0) for item in breakdown)
+        analysis['score'] = round(5 + 5 * (score_sum / len(breakdown)), 1) if breakdown else 0.0
+        analysis['match_stats'] = f"{len(breakdown)}条满足{met_count}条"
+
+    sorted_list = sorted(analysis_list, key=lambda x: x.get('score', 0.0), reverse=True)
+    top_score = sorted_list[0]['score'] if sorted_list else 0.0
+    best_fit = sorted_list[0]['position_title'] if sorted_list else "无匹配职位"
+    
+    report_text = f"## AI 智能匹配报告\n\n**候选人**: {profile_data.get('name', 'N/A')}\n**最佳匹配职位**: {best_fit}\n**最高匹配分**: {top_score:.1f}\n**核心推荐理由**: {sanitized_data.get('overall_summary', {}).get('key_rationale', 'N/A')}\n\n---\n\n### 各职位详细分析\n"
+    for item in sorted_list:
+        report_text += f"\n#### **{item.get('position_title')}** - 评分: {item.get('score', 0.0):.1f} ({item.get('match_stats', '')})\n- **优势总结**: {item.get('strengths_summary', 'N/A')}\n- **差距总结**: {item.get('gaps_summary', 'N/A')}\n"
+    
+    return {"filename": filename, "name": profile_data.get('name'), "phone": profile_data.get('phone'), "email": profile_data.get('email'), "top_score": top_score, "best_fit": best_fit, "reason": sanitized_data.get('overall_summary', {}).get('key_rationale', 'N/A'), "full_report_text": report_text, "full_report_data": sanitized_data}
+
+async def check_candidate_existence_async(async_notion, candidate_name, candidate_email):
+    if not CANDIDATE_PROFILE_HUB_DB_ID: return None
+    db_filter = {"or": []}
+    if candidate_email and candidate_email.lower() != 'n/a':
+        db_filter["or"].append({"property": NOTION_PROPS["profile_name"].replace("姓名", NOTION_PROPS["analysis_email"]), "email": {"equals": candidate_email}})
+    if candidate_name and candidate_name not in ['N/A', '未知候选人']:
+        db_filter["or"].append({"property": NOTION_PROPS["profile_name"], "title": {"equals": candidate_name}})
+    if not db_filter["or"]: return None
+    try:
+        response = await async_notion.databases.query(database_id=CANDIDATE_PROFILE_HUB_DB_ID, filter=db_filter, page_size=1)
+        if response and response['results']:
+            page = response['results'][0]; page_id = page['id']
+            hash_prop = page['properties'].get(NOTION_PROPS["profile_resume_hash"], {})
+            old_hash = hash_prop.get('rich_text', [{}])[0].get('plain_text', '') if hash_prop.get('rich_text') else ''
+            analysis_relation = page['properties'].get(NOTION_PROPS["profile_relation_to_analysis"], {}).get('relation', [])
+            analysis_page_id = analysis_relation[0]['id'] if analysis_relation else None
+            print(f"   -> [去重检查] 发现已存在候选人 '{candidate_name}' 的档案。")
+            return {"profile_page_id": page_id, "analysis_page_id": analysis_page_id, "old_hash": old_hash}
+    except APIResponseError as e:
+        if "Could not find property with name" in e.body:
+             print(f"   !! [去重检查] 警告: 您的'候选人信息库'可能缺少名为 '{NOTION_PROPS['analysis_email']}' 或 '{NOTION_PROPS['profile_name']}' 的属性。")
+        else: print(f"   !! [去重检查] 查询Notion时发生错误: {e.body}")
+    except Exception as e: print(f"   !! [去重检查] 查询Notion时发生未知错误: {e}")
+    return None
+
+async def save_or_update_analysis_report_async(async_notion, report_data, resume_text, existing_page_id=None):
+    # 【【【 终极修正：在此处就地导入 datetime 模块 】】】
+    from datetime import datetime, timezone, timedelta
+    
+    beijing_time = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))); score = float(report_data.get('top_score', 0))
+    if score >= 9: tag = "🌟 S级 (必须拿下)"
+    # ... 后续代码保持不变 ...
+    elif score >= 8: tag = "🔥 A级 (重点跟进)"
+    elif score >= 7: tag = "✅ B级 (符合预期)"
+    else: tag = "🤔 C级 (待定观察)"
+    action = "更新" if existing_page_id else "创建"
+    props = {
+        NOTION_PROPS["analysis_name"]: {"title": [{"text": {"content": report_data.get('name', '解析失败')}}]},
+        NOTION_PROPS["analysis_phone"]: {"phone_number": report_data.get('phone') if report_data.get('phone') and report_data.get('phone') != 'N/A' else None},
+        NOTION_PROPS["analysis_email"]: {"email": report_data.get('email') if report_data.get('email') and report_data.get('email') != 'N/A' else None},
+        NOTION_PROPS["analysis_date"]: {"date": {"start": beijing_time.isoformat()}},
+        NOTION_PROPS["analysis_source"]: {"rich_text": [{"text": {"content": report_data.get('filename', 'N/A')}}]},
+        NOTION_PROPS["analysis_best_fit_position"]: {"rich_text": [{"text": {"content": report_data.get('best_fit', 'N/A')}}]},
+        NOTION_PROPS["analysis_reason"]: {"rich_text": split_text_for_notion(report_data.get('reason', '无'))},
+        NOTION_PROPS["analysis_top_score"]: {"number": score}, NOTION_PROPS["analysis_score"]: {"number": score},
+        NOTION_PROPS["analysis_priority"]: {"select": {"name": tag}}
+    }
+    if action == "更新": props[NOTION_PROPS["analysis_update_flag"]] = {"checkbox": True}
+    final_props = {k: v for k, v in props.items() if v is not None}
+    print(f"\n>> [Notion同步] 正在{action} '{report_data.get('name', 'N/A')}' 的分析报告...")
+    try:
+        if existing_page_id:
+            await async_notion.pages.update(page_id=existing_page_id, properties=final_props)
+            old_blocks_resp = await async_notion.blocks.children.list(block_id=existing_page_id)
+            for block in old_blocks_resp['results']: 
+                try: await async_notion.blocks.delete(block_id=block['id'])
+                except APIResponseError: pass
+            page_id_to_return = existing_page_id
+        else:
+            new_page = await async_notion.pages.create(parent={"database_id": CANDIDATE_DB_ID}, icon={"type": "emoji", "emoji": "🎯"}, properties=final_props)
+            page_id_to_return = new_page.get('id')
+        full_page_content_text = report_data['full_report_text'] + "\n\n---\n\n## 原始简历文本\n" + resume_text
+        content_chunks = [full_page_content_text[i:i + 2000] for i in range(0, len(full_page_content_text), 2000)]
+        children_to_append = [{"type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk}}]}} for chunk in content_chunks]
+        await async_notion.blocks.children.append(block_id=page_id_to_return, children=children_to_append[:100])
+        print(f"✅ [Notion同步] 成功{action}分析报告！")
+        return page_id_to_return
+    except Exception as e: print(f"❌ 错误: {action}分析报告到Notion失败: {e}"); return None
+
+async def save_or_update_candidate_profile_async(async_notion, report_data, analysis_page_id, enhancement_data, resume_text, existing_page_id=None):
+    full_report_data = report_data.get("full_report_data", {}); profile_data = full_report_data.get("profile_data", {})
+    action = "更新" if existing_page_id else "创建"; print(f">> [档案{action}] 启动候选人档案流程...")
+    def format_profile_copy_paste(data):
+        lines = []
+        if data.get('name'): lines.append(f"姓名: {data['name']}")
+        if data.get('phone'): lines.append(f"电话: {data['phone']}")
+        if data.get('email'): lines.append(f"邮箱: {data['email']}")
+        if data.get('education'): lines.append(f"学历: {data['education']}")
+        if data.get('work_experience_summary'): lines.append(f"经验: {data['work_experience_summary']}")
+        return "\n".join(lines)
+    props = {
+        NOTION_PROPS["profile_name"]: {"title": [{"text": {"content": profile_data.get('name', 'N/A')}}]},
+        NOTION_PROPS.get("profile_email"): {"email": profile_data.get('email') if profile_data.get('email') and profile_data.get('email') != 'N/A' else None},
+        NOTION_PROPS["profile_age"]: {"number": int(profile_data.get('age', 0)) if str(profile_data.get('age', 0)).isdigit() else None},
+        NOTION_PROPS["profile_gender"]: {"select": {"name": profile_data.get('gender')}} if profile_data.get('gender') not in ['N/A', '', None] else None,
+        NOTION_PROPS["profile_education"]: {"rich_text": split_text_for_notion(profile_data.get('education', 'N/A'))},
+        NOTION_PROPS["profile_employment_status"]: {"select": {"name": profile_data.get('employment_status')}} if profile_data.get('employment_status') not in ['N/A', '', None] else None,
+        NOTION_PROPS["profile_experience"]: {"rich_text": split_text_for_notion(profile_data.get('work_experience_summary', 'N/A'))},
+        NOTION_PROPS["profile_core_skills"]: {"rich_text": split_text_for_notion(profile_data.get('core_competencies', 'N/A'))},
+        NOTION_PROPS["profile_current_location"]: {"rich_text": [{"text": {"content": profile_data.get('current_location', 'N/A')}}]},
+        NOTION_PROPS["profile_expected_city"]: {"rich_text": [{"text": {"content": profile_data.get('expected_city', 'N/A')}}]},
+        NOTION_PROPS["profile_availability"]: {"rich_text": [{"text": {"content": profile_data.get('availability', 'N/A')}}]},
+        NOTION_PROPS["profile_resume_hash"]: {"rich_text": [{"text": {"content": get_content_hash(resume_text)}}]},
+        NOTION_PROPS["profile_copy_paste_area"]: {"rich_text": split_text_for_notion(format_profile_copy_paste(profile_data))},
+        NOTION_PROPS["profile_web_summary"]: {"rich_text": split_text_for_notion(str(enhancement_data.get('web_summary', 'N/A')))},
+        NOTION_PROPS["profile_similar_candidates"]: {"rich_text": split_text_for_notion(str(enhancement_data.get('similar_candidates_context', 'N/A')))},
+    }
+    if analysis_page_id: props[NOTION_PROPS["profile_relation_to_analysis"]] = {"relation": [{"id": analysis_page_id}]}
+    final_props = {k: v for k, v in props.items() if k and v is not None}
+    try:
+        if existing_page_id:
+            await async_notion.pages.update(page_id=existing_page_id, properties=final_props)
+            page_id_for_vector = existing_page_id
+        else:
+            new_profile_page = await async_notion.pages.create(parent={"database_id": CANDIDATE_PROFILE_HUB_DB_ID}, properties=final_props)
+            page_id_for_vector = new_profile_page.get('id')
+        print(f"✅ [Notion同步] 成功将档案{action}到 [候选人信息库]！")
+        # 启动后台任务进行向量化，不阻塞当前流程
+        asyncio.create_task(vectorize_and_store_profile_async(page_id_for_vector, profile_data, report_data))
+        return page_id_for_vector
+    except Exception as e: print(f"❌ 错误: {action}到'候选人信息库'失败: {e}"); return None
+
+async def sync_company_to_notion_and_vectorize_async(async_notion, company_data, analysis_page_id, profile_page_id):
+    if not COMPANY_DB_ID or not company_data: return
+    company_name = company_data.get("company_name");
+    if not company_name: return
+    print(f"   -> [公司情报同步] 正在同步 '{company_name}' 的情报...")
+    try:
+        response = await async_notion.databases.query(database_id=COMPANY_DB_ID, filter={"property": NOTION_PROPS["comp_name"], "title": {"equals": company_name}}, page_size=1)
+        existing_page = response.get('results')[0] if response.get('results') else None
+    except Exception as e: print(f"   !! 检查已存在公司时出错: {e}"); existing_page = None
+    swot = company_data.get('swot_analysis', {}); swot_text = f"**优势:** {swot.get('strengths', 'N/A')}\n**劣势:** {swot.get('weaknesses', 'N/A')}\n**机会:** {swot.get('opportunities', 'N/A')}\n**威胁:** {swot.get('threats', 'N/A')}"
+    props = {
+        NOTION_PROPS["comp_name"]: {"title": [{"text": {"content": company_name}}]},
+        NOTION_PROPS["comp_one_liner"]: {"rich_text": split_text_for_notion(company_data.get('one_liner'))},
+        NOTION_PROPS["comp_industry"]: {"multi_select": [{"name": tag} for tag in company_data.get('industry_sector', []) if tag]},
+        NOTION_PROPS["comp_tech_stack"]: {"multi_select": [{"name": tech} for tech in company_data.get('tech_stack', []) if tech]},
+        NOTION_PROPS["comp_core_business"]: {"rich_text": split_text_for_notion(company_data.get('core_business_products'))},
+        NOTION_PROPS["comp_competitors"]: {"rich_text": split_text_for_notion('\n'.join(company_data.get('competitors', [])))},
+        NOTION_PROPS["comp_latest_news"]: {"rich_text": split_text_for_notion(company_data.get('latest_news_funding'))},
+        NOTION_PROPS["comp_swot"]: {"rich_text": split_text_for_notion(swot_text)},
+        NOTION_PROPS["comp_info_source"]: {"rich_text": split_text_for_notion(company_data.get('info_source'))}
+    }
+    relations = []; profile_relations = []
+    if analysis_page_id: relations.append({"id": analysis_page_id})
+    if relations: props[NOTION_PROPS["comp_relation_to_analysis"]] = {"relation": relations}
+    if profile_page_id: profile_relations.append({"id": profile_page_id})
+    if profile_relations: props[NOTION_PROPS["comp_relation_to_profile"]] = {"relation": profile_relations}
+    final_props = {k: v for k, v in props.items() if v and (isinstance(v, dict) and v.get("multi_select") is not None and v["multi_select"] or "multi_select" not in v)}
+    try:
+        if existing_page:
+            await async_notion.pages.update(page_id=existing_page['id'], properties=final_props)
+            company_page_id = existing_page['id']
+        else:
+            new_page = await async_notion.pages.create(parent={"database_id": COMPANY_DB_ID}, properties=final_props)
+            company_page_id = new_page['id']
+        print(f"   ✅ 公司 '{company_name}' 情报已同步。")
+        asyncio.create_task(vectorize_company_data_async(company_page_id, company_data))
+        return company_page_id
+    except Exception as e: print(f"   !! Notion API同步公司情报时出错: {e}"); return None
+
+# ==============================================================================
+# ⬇⬇⬇ 向量化 & 训练中心 (v20.0 异步改造版) ⬇⬇⬇
+# ==============================================================================
+async def vectorize_and_store_profile_async(page_id, profile_data, full_report_data):
+    if not IS_RAG_ENABLED or not profile_data: return
+    candidate_name = profile_data.get('name', '未知候选人')
+    print(f"   -> [后台任务] 正在向量化候选人 '{candidate_name}' 的综合档案...")
+    try:
+        factual_summary = f"姓名: {profile_data.get('name')}, 学历: {profile_data.get('education')}, 经验: {profile_data.get('work_experience_summary')}, 核心能力: {profile_data.get('core_competencies')}"
+        analysis_summary = f"AI首要推荐: {full_report_data['best_fit']}, 理由: {full_report_data['reason']}"
+        comprehensive_text = f"{factual_summary}\n\n--- AI分析摘要 ---\n{analysis_summary}"
+        
+        loop = asyncio.get_running_loop()
+        vector = await EMBEDDING_MODEL.aembed_query(comprehensive_text) # <<< 修改后
+        # ...
+        # 【【【 新增：在这里定义 payload 】】】
+        payload = { "summary_text": comprehensive_text, "source_title": f"候选人综合档案: {candidate_name}" }
+        await loop.run_in_executor(None, lambda: QDRANT_CLIENT.upsert(
+            collection_name=RECRUITMENT_COLLECTION_NAME,
+            points=[models.PointStruct(id=str(page_id), vector=vector, payload=payload)], # <<< 修改后
+            wait=True
+        ))
+        print(f"   ✅ [后台任务] 成功将 '{candidate_name}' 的档案向量化！")
+    except Exception as e:
+        print(f"   !! [后台任务] 向量化候选人档案时出错: {e}")
+
+async def vectorize_company_data_async(company_page_id, company_data):
+    if not IS_RAG_ENABLED or not company_data or not company_page_id: return
+    company_name = company_data.get("company_name", "Unknown Company")
+    print(f"   -> [后台任务] 正在向量化公司 '{company_name}' 的情报...")
+    try:
+        text_parts = [f"公司: {company_name}", f"业务: {company_data.get('one_liner')}", f"产品: {company_data.get('core_business_products')}"]
+        comprehensive_text = "\n".join(filter(None, text_parts))
+        
+        loop = asyncio.get_running_loop()
+        vector = await EMBEDDING_MODEL.aembed_query(comprehensive_text) # <<< 修改后
+        # ...
+        await loop.run_in_executor(None, lambda: QDRANT_CLIENT.upsert(
+            collection_name=RECRUITMENT_COLLECTION_NAME,
+            points=[models.PointStruct(id=str(company_page_id), vector=vector, payload=payload)], # <<< 修改后
+            wait=True
+        ))
+        print(f"   ✅ [后台任务] 成功将公司 '{company_name}' 的情报向量化！")
+    except Exception as e:
+        print(f"   !! [后台任务] 向量化公司情报时出错: {e}")
+
+async def write_to_training_hub_async(async_notion, resume_text, parsed_analysis_data, analysis_page_id, company_research_results):
+    if not TRAINING_HUB_DATABASE_ID: return
+    print("   -> [后台任务] 正在写入训练中心...")
+    try:
+        full_training_output = { "candidate_analysis": parsed_analysis_data, "company_intelligence": company_research_results }
+        output_str = json.dumps(full_training_output, ensure_ascii=False, indent=2)
+        title = f"【简历分析】{parsed_analysis_data.get('profile_data', {}).get('name', '未知')}"
+        props = {
+            NOTION_PROPS["training_task_title"]: {"title": [{"text": {"content": title}}]},
+            NOTION_PROPS["training_task_type"]: {"select": {"name": "简历分析-旗舰版"}},
+            NOTION_PROPS["training_input"]: {"rich_text": split_text_for_notion(resume_text)},
+            NOTION_PROPS["training_output"]: {"rich_text": split_text_for_notion(output_str)},
+            NOTION_PROPS["training_status"]: {"select": {"name": "待审核"}},
+        }
+        if analysis_page_id:
+            props[NOTION_PROPS["training_relation_to_candidate"]] = {"relation": [{"id": analysis_page_id}]}
+        await async_notion.pages.create(parent={"database_id": TRAINING_HUB_DATABASE_ID}, properties=props)
+        print("   ✅ [后台任务] 成功写入训练中心！")
+    except Exception as e:
+        print(f"   !! [后台任务] 写入训练中心时发生错误: {e}")
+
+# ==============================================================================
+# ⬇⬇⬇ 主执行模式 (v20.0 高并发流水线) ⬇⬇⬇
+# ==============================================================================
+
+async def process_single_resume_async(file_path, all_jds_text, worker_name):
+    """
+    这是单个简历的完整异步处理逻辑，由一个worker调用。
+    """
+    filename = os.path.basename(file_path)
+    async_notion = notion_client.AsyncClient(auth=NOTION_TOKEN) # 每个任务创建自己的客户端
+    loop = asyncio.get_running_loop()
+    
+    # 步骤 1: 读取文件 (在Executor中)
+    resume_text, error_msg = await loop.run_in_executor(None, read_file_content, file_path)
+    if error_msg: raise Exception(f"读取文件失败: {error_msg}")
+
+    # 步骤 2: 初始分析以提取关键信息
+    print(f">> [{worker_name}] [流程 1/4] 初始分析与信息预提取...")
+    initial_analysis_json = await analyze_with_hyper_awareness_v15_async(resume_text, all_jds_text, {}, worker_name)
+    if not initial_analysis_json: raise Exception("AI初始分析返回空内容")
+    
+    parsed_initial_data = await loop.run_in_executor(None, json.loads, clean_json_response(initial_analysis_json))
+    if not parsed_initial_data.get("is_resume"):
+        print(f">> [{worker_name}] AI判断 '{filename}' 不是有效简历，将跳过。")
+        return "skipped_not_resume"
+
+    sanitized_initial_data = sanitize_parsed_data(parsed_initial_data)
+    profile_data = sanitized_initial_data.get('profile_data', {})
+    candidate_name = profile_data.get('name'); candidate_email = profile_data.get('email')
+    company_names_list = sanitized_initial_data.get('overall_summary', {}).get('estimated_company_names', [])
+    
+    # 步骤 3: 智能去重与数据增强
+    print(f"\n>> [{worker_name}] [流程 2/4] 智能去重与数据增强...")
+    existing_candidate_info = await check_candidate_existence_async(async_notion, candidate_name, candidate_email)
+    if existing_candidate_info and existing_candidate_info.get("old_hash") == get_content_hash(resume_text):
+        print(f"   -> [{worker_name}] [跳过] 候选人 '{candidate_name}' 已存在且简历无变化。")
+        return "skipped_no_change"
+    
+    enhancement_data = await enrich_candidate_data_async(resume_text, candidate_name, company_names_list)
+
+    # 步骤 4: 注入增强数据，进行最终深度分析
+    print(f"\n>> [{worker_name}] [流程 3/4] 注入增强数据，进行最终深度分析...")
+    final_analysis_json_text = await analyze_with_hyper_awareness_v15_async(resume_text, all_jds_text, enhancement_data, worker_name)
+    if not final_analysis_json_text: raise Exception("AI最终深度分析返回空内容")
+    
+    final_parsed_data = await loop.run_in_executor(None, json.loads, clean_json_response(final_analysis_json_text))
+    
+    # 步骤 5: 解析最终报告并同步到Notion
+    print(f"\n>> [{worker_name}] [流程 4/4] 解析最终报告并准备同步...")
+    report_data = await loop.run_in_executor(None, calculate_and_format_report_v15, final_parsed_data, filename, resume_text)
+    
+    # ... (Notion同步流程) ...
+    existing_analysis_id = existing_candidate_info.get("analysis_page_id") if existing_candidate_info else None
+    analysis_page_id = await save_or_update_analysis_report_async(async_notion, report_data, resume_text, existing_analysis_id)
+    if not analysis_page_id: raise Exception("未能创建或更新Notion分析报告页面")
+    
+    existing_profile_id = existing_candidate_info.get("profile_page_id") if existing_candidate_info else None
+    profile_page_id = await save_or_update_candidate_profile_async(async_notion, report_data, analysis_page_id, enhancement_data, resume_text, existing_profile_id)
+    if not profile_page_id: print(f"⚠️ [{worker_name}] 警告：成功同步分析报告，但档案同步失败。")
+
+    if enhancement_data.get('company_research_results'):
+        company_tasks = [
+            sync_company_to_notion_and_vectorize_async(async_notion, company_data, analysis_page_id, profile_page_id)
+            for company_data in enhancement_data['company_research_results'] if company_data
+        ]
+        company_page_ids = await asyncio.gather(*company_tasks)
+        company_page_ids = [pid for pid in company_page_ids if pid] # Filter out None results
+        
+        if company_page_ids:
+            try:
+                await async_notion.pages.update(page_id=analysis_page_id, properties={NOTION_PROPS["analysis_relation_to_company"]: {"relation": [{"id": pid} for pid in company_page_ids]}})
+                if profile_page_id:
+                    await async_notion.pages.update(page_id=profile_page_id, properties={NOTION_PROPS["profile_relation_to_company"]: {"relation": [{"id": pid} for pid in company_page_ids]}})
+            except APIResponseError as e: print(f"   !! [{worker_name}] [关联回写] 更新关联失败: {e.body}")
+
+    # 启动后台任务，不阻塞
+    asyncio.create_task(write_to_training_hub_async(async_notion, resume_text, final_parsed_data, analysis_page_id, enhancement_data.get('company_research_results')))
+    
+    return {"status": "success", "report": report_data}
+
+
+async def resume_worker(name, queue, all_jds_text, result_lists):
+    """
+    消费者 Worker 函数。
+    """
+    processed_summaries, failed_files, skipped_files = result_lists
+    while True:
+        try:
+            file_path = await queue.get()
+            filename = os.path.basename(file_path)
+            print(f"[{name}] 开始处理: {filename}")
+            
+            RESUMES_DIR = "resumes_to_process"
+            PROCESSED_DIR, FAILED_DIR, SKIPPED_DIR = "processed_resumes_batch_match", "processed_failed", "processed_skipped_duplicates"
+            
+            try:
+                result = await process_single_resume_async(file_path, all_jds_text, name)
+                
+                if isinstance(result, str) and result.startswith("skipped"):
+                    if result == "skipped_not_resume":
+                        skipped_files.append(f"{filename} (非简历)")
+                        shutil.move(file_path, os.path.join(SKIPPED_DIR, filename))
+                    elif result == "skipped_no_change":
+                        skipped_files.append(f"{filename} (简历未变)")
+                        shutil.move(file_path, os.path.join(SKIPPED_DIR, filename))
+                elif isinstance(result, dict) and result.get("status") == "success":
+                    report_data = result['report']
+                    processed_summaries.append({
+                        "name": report_data['name'], "score": report_data['top_score'], "position": report_data['best_fit']
+                    })
+                    print(f"\n✅ [{name}] 候选人 '{report_data['name']}' ({filename}) 分析与同步完成。")
+                    shutil.move(file_path, os.path.join(PROCESSED_DIR, filename))
+
+            except Exception as e:
+                print(f"!! [{name}] 处理 {filename} 失败: {e}\n{traceback.format_exc()}");
+                failed_files.append(f"{filename} (错误: {str(e)[:50]}...)")
+                shutil.move(file_path, os.path.join(FAILED_DIR, filename))
+                
+            finally:
+                queue.task_done()
+        except asyncio.CancelledError:
+            # print(f"[{name}] 收到关闭信号，正在退出...")
+            break
+
+# 【【【 v20.0 改造：高并发流水线调度器 】】】
+async def batch_mode_high_concurrency():
+    print("\n" + "="*14 + " 批量智能匹配模式 (v20.0 高并发版) " + "="*14)
+    RESUMES_DIR, PROCESSED_DIR = "resumes_to_process", "processed_resumes_batch_match"
+    FAILED_DIR, SKIPPED_DIR = "processed_failed", "processed_skipped_duplicates"
+    for d in [RESUMES_DIR, PROCESSED_DIR, FAILED_DIR, SKIPPED_DIR]: os.makedirs(d, exist_ok=True)
+
+    resumes_to_process = [f for f in os.listdir(RESUMES_DIR) if f.lower().endswith(('.pdf', '.docx', '.txt'))]
+    if not resumes_to_process:
+        print(f"\n在 '{RESUMES_DIR}' 文件夹中没有找到简历。"); return
+
+    print(f"\n找到 {len(resumes_to_process)} 份简历, 将与 {len(ACTIVE_JD_DATA)} 个有效职位进行匹配...")
+    all_jds_text = JOB_SEPARATOR.join([f"职位名称: {title}\n\n职位详情:\n{data['content']}" for title, data in ACTIVE_JD_DATA.items()])
+
+    # 1. 创建一个任务队列和结果列表
+    queue = asyncio.Queue()
+    processed_summaries, failed_files, skipped_files = [], [], []
+    result_lists = (processed_summaries, failed_files, skipped_files)
+
+    # 2. 生产者：快速将所有任务（文件名）放入队列
+    for filename in resumes_to_process:
+        await queue.put(os.path.join(RESUMES_DIR, filename))
+
+    # 3. 创建 N 个消费者（worker）
+    worker_tasks = []
+    for i in range(WORKER_COUNT):
+        task = asyncio.create_task(resume_worker(f"Worker-{i+1}", queue, all_jds_text, result_lists))
+        worker_tasks.append(task)
+
+    # 4. 等待所有任务完成
+    await queue.join()
+
+    # 5. 优雅地关闭所有 worker
+    for task in worker_tasks:
+        task.cancel()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+    # ... (最后打印总结报告) ...
+    print("\n" + "="*70)
+    print("✅ 所有简历批量智能匹配完毕！")
+    print("="*28 + " 最终总结报告 " + "="*28)
+    print(f"\n成功处理: {len(processed_summaries)} 份")
+    if processed_summaries:
+        print(f"| {'候选人姓名':<20} | {'最高分':<8} | {'最匹配职位':<30} |")
+        print(f"|{'-'*22}|{'-'*10}|{'-'*32}|")
+        sorted_summaries = sorted(processed_summaries, key=lambda x: x['score'], reverse=True)
+        for summary in sorted_summaries:
+            name_str = str(summary['name']); pos_str = str(summary['position'])
+            name = (name_str[:17] + '...') if len(name_str) > 20 else name_str
+            pos = (pos_str[:27] + '...') if len(pos_str) > 30 else pos_str
+            print(f"| {name:<20} | {summary['score']:<8.1f} | {pos:<30} |")
+    print(f"\n跳过处理: {len(skipped_files)} 份"); [print(f"  - {f}") for f in skipped_files]
+    print(f"\n处理失败: {len(failed_files)} 份"); [print(f"  - {f}") for f in failed_files]
+    print("="*70)
+
+# ==============================================================================
+# ⬇⬇⬇ 人才激活模式 & 程序入口 (v20.0 适配版) ⬇⬇⬇
+# ==============================================================================
+def talent_activation_mode():
+    if not IS_RAG_ENABLED: print("\n错误: 无法执行人才激活，RAG功能未启用。"); return
+    if not ACTIVE_JD_DATA: print("\n错误: 未加载到任何有效JD，无法进行人才激活。"); return
+
+    print("\n" + "="*23 + " 人才激活模式 " + "="*23)
+    jd_titles = list(ACTIVE_JD_DATA.keys())
+    for i, title in enumerate(jd_titles): print(f"  {i + 1}. {title}")
+    
+    while True:
+        try:
+            choice_idx = int(input(f"\n请选择一份用于激活人才的JD (1-{len(jd_titles)}): ").strip()) - 1
+            if 0 <= choice_idx < len(jd_titles):
+                selected_title, selected_jd_content = jd_titles[choice_idx], ACTIVE_JD_DATA[jd_titles[choice_idx]]['content']
+                break
+            else: print("无效选择。")
+        except (ValueError, IndexError): print("无效输入。")
+        
+    top_n = int(input("希望看到最匹配的前几位候选人？ (默认5): ").strip() or 5)
+    print(f"\n>> [人才激活] 正在用【{selected_title}】在历史库中寻找前 {top_n} 位候选人...")
+    try:
+        # 【【【 v20.0 改造：适配 Qdrant 和本地模型 】】】
+        query_vector = EMBEDDING_MODEL.embed_query(selected_jd_content) # <<< 修改后
+        results = QDRANT_CLIENT.search(
+            collection_name=RECRUITMENT_COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=top_n,
+            with_payload=True
+        )
+
+        if not results:
+            print("\n>> [人才激活] 未在历史库中找到任何匹配的候选人档案。"); return
+
+        print("\n" + "="*25 + " 人才激活推荐榜单 " + "="*25)
+        for i, hit in enumerate(results):
+            title = hit.payload.get('source_title', f"候选人 {i+1}")
+            similarity_score = hit.score * 100
+            doc = hit.payload.get('summary_text', '摘要不可用')
+            print(f"\n--- Top {i+1}: {title} (匹配度: {similarity_score:.2f}%) ---")
+            print(doc)
+        print("\n" + "="*68)
+    except Exception as e: print(f"\n!! [人才激活] 查询时发生错误: {e}")
+
+async def main():
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("="*10 + " AI 招聘助理 v20.0 - Fedora 高并发版 (本地化) " + "="*10) # <--- 名称更新
+    print(">> 系统启动: 正在初始化本地模型和数据库连接...")
+    print("-" * 70)
+
+    # 【【【 核心修正：将 global 声明移到函数顶部 】】】
+    global ENABLE_GOOGLE_SEARCH
+
+    # --- 这里是核心修改 ---
+    if not configure_llm(): # <<< 修改后
+        input("本地大语言模型初始化失败，按回车键退出。")
+        sys.exit(1)
+        
+    # Google Search 的部分保持不变...
+    if ENABLE_GOOGLE_SEARCH and (not GOOGLE_API_KEY or "AIza" not in GOOGLE_API_KEY or not GOOGLE_CSE_ID):
+        print("⚠️ [警告] Google搜索已启用，但 .env 文件中的API Key或CSE ID未正确配置。搜索功能将不可用。")
+        ENABLE_GOOGLE_SEARCH = False
+    
+    setup_qdrant_and_embedding() # 这个函数我们已经升级了
+    
+    if not await load_active_jd_from_notion_async():
+        input("从Notion加载JD失败，请检查配置后按回车键退出。")
+        sys.exit(1)
+
+    # ... main 函数的后续 while 循环部分保持不变 ...
+    while True:
+        print("\n" + "="*28 + " 主菜单 " + "="*28)
+        print("  1. [批量智配]   - (v20.0 高并发版) 分析简历")
+        print("  2. [人才激活]   - (RAG) 用JD在历史库中激活候选人")
+        print("\n  Q. 退出程序")
+        print("="*65)
+        choice = input("请输入您的选择 (1, 2, 或 Q): ").strip().upper()
+        if choice == '1':
+            await batch_mode_high_concurrency()
+        elif choice == '2':
+            talent_activation_mode()
+        elif choice == 'Q':
+            print("\n程序已退出。")
+            break
+        else:
+            print("\n无效输入，请重新选择。")
+        input("\n当前模式任务已完成，按回车键返回主菜单...")
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n检测到用户中断，正在关闭...")
+    finally:
+        # 确保所有后台任务（如果有的话）都有机会完成
+        # 在asyncio.run()之后，事件循环已关闭，不能再等待任务
+        print(">> 所有任务完成，程序安全退出。")

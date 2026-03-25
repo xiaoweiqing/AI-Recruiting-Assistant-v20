@@ -1,0 +1,45 @@
+# ===================================================================
+#  requirements.txt for AI-Recruiting-Assistant-v3.1
+#  (Llama.cpp 本地服务器稳定并发版)
+# ===================================================================
+
+# --- 核心 AI 逻辑库 ---
+# LangChain 基础库
+langchain
+langchain-community
+httpx
+# Llama.cpp 的 Python 绑定。
+# [server] 会自动安装 uvicorn, fastapi 等所有运行服务器所需的依赖。
+llama-cpp-python[server]
+
+# LangChain 的 OpenAI 客户端，用于连接我们自己启动的本地服务器。
+langchain-openai
+
+# --- Notion API ---
+notion-client
+
+# --- 向量数据库 ---
+qdrant-client
+
+# --- 文件解析 ---
+PyMuPDF     # 用于解析 .pdf 文件
+python-docx # 用于解析 .docx 文件
+
+# --- 工具库 ---
+python-dotenv # 用于从 .env 文件加载环境变量
+
+# --- 性能优化 (推荐) ---
+# 在 Linux/macOS 上可以显著提升 asyncio 的性能
+uvloop
+        python-dotenv
+        notion-client
+        langchain-core
+        langchain-huggingface  # <-- 核心改变
+        langchain-openai
+        qdrant-client
+        watchdog
+        PyMuPDF
+        python-docx
+        sentence-transformers  # <-- HuggingFaceEmbeddings 需要
+        numpy                # <-- v33.0 需要
+        langchain-google-genai
